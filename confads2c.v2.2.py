@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-CONFADS2C: Interactive Conformational Search & QM Preparation Workflow (v2.1)
+CONFADS2C: Interactive Conformational Search & QM Preparation Workflow (v2.2)
 =============================================================================
 Supported Tools: RDKit, OpenBabel, xTB, CREST, CONFPASS, ORCA, SLURM
 Features:
   - Universal molecule support (neutral, cations, anions, radicals, metal complexes)
   - Automatic charge & spin multiplicity detection with user confirmation
   - High-performance native 3D embedding via RDKit ETKDGv3
+  - Thread safety controls preventing OpenBLAS/MKL/OpenMP log inflation bug (v2.2)
   - Interactive smart prompts with preset choices and safety checks
   - Process safety via safe subprocess execution (shell=False)
   - Detailed terminal timing, progress spinners, and output summary report
@@ -16,6 +17,18 @@ Features:
 
 import os
 import sys
+
+# ------------------------------------------------------------
+# Environment Safety & Thread Oversaturation Control (v2.2 Fix)
+# Prevent OpenBLAS / MKL / OMP thread explosion and infinite log growth
+# ------------------------------------------------------------
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["OMP_STACKSIZE"] = "1G"
+os.environ["OPENBLAS_VERBOSE"] = "0"
+
 import re
 import time
 import threading
@@ -36,9 +49,7 @@ except ImportError:
     print("Or activate your computational chemistry environment.")
     sys.exit(1)
 
-# ------------------------------------------------------------
 # ANSI Color Formatting & Terminal Styling
-# ------------------------------------------------------------
 GREEN = '\033[0;32m'
 YELLOW = '\033[1;33m'
 BLUE = '\033[0;34m'
@@ -53,9 +64,6 @@ ICON_FAIL = f"{RED}✗{NC}"
 ICON_WARN = f"{YELLOW}⚠{NC}"
 ICON_INFO = f"{CYAN}ℹ{NC}"
 
-# ------------------------------------------------------------
-# Thread-Safe Interactive Spinner
-# ------------------------------------------------------------
 class Spinner:
     """Animated progress spinner for long-running subprocess tasks."""
     def __init__(self, message=" Executing..."):
@@ -84,9 +92,6 @@ class Spinner:
         if self.thread:
             self.thread.join(timeout=0.5)
 
-# ------------------------------------------------------------
-# Safe Subprocess Execution Wrapper
-# ------------------------------------------------------------
 def run_command_safe(cmd_list, step_name, stdout_log=None, stderr_log=None, use_spinner=True):
     """Executes external commands safely as argument lists without shell injection risks."""
     print(f" {ICON_INFO} {BOLD}{step_name}{NC} starting...")
@@ -105,6 +110,7 @@ def run_command_safe(cmd_list, step_name, stdout_log=None, stderr_log=None, use_
             stdout=stdout_target,
             stderr=stderr_target,
             text=True,
+            env=os.environ,
             check=False
         )
     finally:
@@ -119,8 +125,13 @@ def run_command_safe(cmd_list, step_name, stdout_log=None, stderr_log=None, use_
         
     elapsed = end_time - start_time
 
+    # Log size safety check
+    if stdout_log and Path(stdout_log).exists():
+        size_mb = Path(stdout_log).stat().st_size / (1024 * 1024)
+        if size_mb > 500:
+            print(f" {ICON_WARN} {YELLOW}Warning: Log file {stdout_log} is large ({size_mb:.1f} MB).{NC}")
+
     if process.returncode != 0:
-        # Special check for non-critical xTB formatting warnings
         if stderr_log and Path(stderr_log).exists():
             with open(stderr_log, 'r') as err_f:
                 err_content = err_f.read()
@@ -132,35 +143,28 @@ def run_command_safe(cmd_list, step_name, stdout_log=None, stderr_log=None, use_
         if stderr_log and Path(stderr_log).exists():
             print(f"{DIM}--- Error Log ({stderr_log}) ---{NC}")
             with open(stderr_log, 'r') as err_f:
-                print(err_f.read()[-1000:])  # Print last 1000 chars
+                print(err_f.read()[-1000:])
         sys.exit(1)
 
     print(f" {ICON_OK} {GREEN}{step_name} completed in {elapsed:.2f}s{NC}")
     return elapsed
 
-# ------------------------------------------------------------
-# Native RDKit 3D Structure Generation
-# ------------------------------------------------------------
 def smiles_to_3d_xyz(mol, output_xyz_path: Path) -> tuple[int, int]:
     """Generates initial 3D coordinates using RDKit ETKDGv3 and MMFF/UFF force fields."""
     mol_with_h = Chem.AddHs(mol)
     
-    # Generate 3D embedding using ETKDGv3 algorithm
     params = AllChem.ETKDGv3()
     params.randomSeed = 42
     embed_res = AllChem.EmbedMolecule(mol_with_h, params)
     
     if embed_res != 0:
-        # Fallback to random coordinates if standard ETKDG fails
         AllChem.EmbedMolecule(mol_with_h, useRandomCoords=True)
 
-    # Force Field Optimization (MMFF94, fallback to UFF if MMFF unsupported)
     if AllChem.MMFFHasAllMoleculeParams(mol_with_h):
         AllChem.MMFFOptimizeMolecule(mol_with_h, maxIters=500)
     else:
         AllChem.UFFOptimizeMolecule(mol_with_h, maxIters=500)
 
-    # Export XYZ file directly
     num_atoms = mol_with_h.GetNumAtoms()
     conf = mol_with_h.GetConformer()
     
@@ -173,23 +177,16 @@ def smiles_to_3d_xyz(mol, output_xyz_path: Path) -> tuple[int, int]:
 
     return num_atoms
 
-# ------------------------------------------------------------
-# Chemical Structure Parsing & Property Detection
-# ------------------------------------------------------------
 def analyze_smiles(smiles_input: str):
     """Parses SMILES and calculates charge, formula, weight, and default spin multiplicity."""
     mol = Chem.MolFromSmiles(smiles_input)
     if mol is None:
         return None
     
-    # Calculate Formal Charge
     charge = Chem.GetFormalCharge(mol)
-    
-    # Calculate Valence / Radicals for Spin Multiplicity
     total_electrons = sum(atom.GetAtomicNum() for atom in Chem.AddHs(mol).GetAtoms()) - charge
     spin_multiplicity = 1 if (total_electrons % 2 == 0) else 2
     
-    # Chemical Info
     formula = rdMolDescriptors.CalcMolFormula(Chem.AddHs(mol))
     mw = Descriptors.MolWt(mol)
     
@@ -202,16 +199,12 @@ def analyze_smiles(smiles_input: str):
         "num_heavy_atoms": mol.GetNumHeavyAtoms()
     }
 
-# ------------------------------------------------------------
-# Interactive User Input Handler
-# ------------------------------------------------------------
 def get_user_inputs():
     """Interactive prompt collector with instant structure verification and smart defaults."""
     print(f"\n{BOLD}{CYAN}======================================================================{NC}")
-    print(f"{BOLD}{CYAN}          CONFADS2C v2.1 — UNIVERSAL CONFORMATIONAL SEARCH            {NC}")
+    print(f"{BOLD}{CYAN}          CONFADS2C v2.2 — UNIVERSAL CONFORMATIONAL SEARCH            {NC}")
     print(f"{BOLD}{CYAN}======================================================================{NC}\n")
 
-    # 1. SMILES Input & Validation Loop
     while True:
         smiles = input(f"{BOLD}Enter SMILES string:{NC} ").strip()
         if not smiles:
@@ -231,16 +224,14 @@ def get_user_inputs():
         print(f"    • Est. Multiplicity : {CYAN}{analysis['spin']}{NC} ({'Singlet/Closed-Shell' if analysis['spin']==1 else 'Doublet/Unpaired'})")
         break
 
-    # 2. Identifier Name Input
     while True:
         default_name = re.sub(r'[^a-zA-Z0-9_-]', '', analysis['formula'])
         name = input(f"\n{BOLD}Enter identifier name [Default: {default_name}]:{NC} ").strip()
         if not name:
             name = default_name
-        name = re.sub(r'[^a-zA-Z0-9_-]', '_', name)  # Sanitize for safe filenames
+        name = re.sub(r'[^a-zA-Z0-9_-]', '_', name)
         break
 
-    # 3. Charge & Multiplicity Override / Confirmation
     print(f"\n{BOLD}Physical / Electronic State Settings:{NC}")
     charge_in = input(f" Confirm/Override Formal Charge [{analysis['charge']}]: ").strip()
     charge = int(charge_in) if charge_in.lstrip('-').isdigit() else analysis['charge']
@@ -248,7 +239,6 @@ def get_user_inputs():
     spin_in = input(f" Confirm/Override Spin Multiplicity (1=Singlet, 2=Doublet, 3=Triplet) [{analysis['spin']}]: ").strip()
     spin = int(spin_in) if spin_in.isdigit() and int(spin_in) > 0 else analysis['spin']
 
-    # 4. Conformational Search Options
     print(f"\n{BOLD}Conformational Search Settings:{NC}")
     n_str = input(f" Number of top conformers to extract for ORCA [Default: 10]: ").strip()
     n_conformers = int(n_str) if n_str.isdigit() else 10
@@ -256,7 +246,6 @@ def get_user_inputs():
     ewin_str = input(f" CREST Energy Window (kcal/mol) [Default: 10.0]: ").strip()
     ewin = float(ewin_str) if ewin_str.replace('.', '', 1).isdigit() else 10.0
 
-    # 5. ORCA QM Settings
     print(f"\n{BOLD}ORCA Quantum Chemistry Settings:{NC}")
     print(" Presets for Level of Theory:")
     print("   [1] B3LYP D3BJ def2-SVP OPT TightOPT FREQ (Fast & Standard)")
@@ -276,7 +265,6 @@ def get_user_inputs():
     else:
         method = "B3LYP D3BJ def2-SVP OPT TightOPT FREQ"
 
-    # 6. Cluster / SLURM Settings
     print(f"\n{BOLD}SLURM Cluster & Execution Settings:{NC}")
     walltime = input(" Walltime limit (HH:MM:SS) [Default: 24:00:00]: ").strip() or "24:00:00"
     ntasks = input(" CPU Cores (--ntasks) [Default: 16]: ").strip() or "16"
@@ -301,9 +289,6 @@ def get_user_inputs():
         "maxcore": maxcore
     }
 
-# ------------------------------------------------------------
-# Conformer Extraction & ORCA/SLURM File Generation
-# ------------------------------------------------------------
 def extract_and_generate(sdf_file: Path, pass_output: Path, cfg: dict) -> tuple[int, Path]:
     """Extracts prioritized conformers and writes XYZ, ORCA input, and SLURM submission scripts."""
     with open(pass_output, 'r') as f:
@@ -335,7 +320,6 @@ def extract_and_generate(sdf_file: Path, pass_output: Path, cfg: dict) -> tuple[
             inp_path = output_dir / f"{base_name}.inp"
             sh_path = output_dir / f"{base_name}.sh"
 
-            # 1. Write XYZ
             num_atoms = mol.GetNumAtoms()
             with open(xyz_path, 'w') as f:
                 f.write(f"{num_atoms}\n{cfg['name']} - Priority Conformer {i} (CONFPASS ID {idx})\n")
@@ -344,17 +328,15 @@ def extract_and_generate(sdf_file: Path, pass_output: Path, cfg: dict) -> tuple[
                     sym = mol.GetAtomWithIdx(ai).GetSymbol()
                     f.write(f"{sym:<2s} {pos.x:12.6f} {pos.y:12.6f} {pos.z:12.6f}\n")
 
-            # 2. Write ORCA Input File (* xyzfile <charge> <spin> ./{base_name}.xyz)
             with open(inp_path, 'w') as f:
                 f.write(f"# {cfg['name']} - Conformer {i} (CONFPASS priority {i})\n")
-                f.write(f"# Generated by CONFADS2C v2.1 on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write(f"# Generated by CONFADS2C v2.2 on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                 f.write(f"! {cfg['method']}\n\n")
                 f.write(f"%pal nprocs {cfg['ntasks']} end\n")
                 if cfg["maxcore"]:
                     f.write(f"%maxcore {cfg['maxcore']}\n")
                 f.write(f"\n* xyzfile {cfg['charge']} {cfg['spin']} ./{base_name}.xyz\n")
 
-            # 3. Write SLURM Script
             with open(sh_path, 'w') as f:
                 f.write(f"""#!/bin/bash
 #SBATCH -J {base_name}
@@ -365,7 +347,6 @@ def extract_and_generate(sdf_file: Path, pass_output: Path, cfg: dict) -> tuple[
 export INPUT="{base_name}.inp"
 export OUTPUT="{base_name}.out"
 
-# Load ORCA environment module (modify if needed for your cluster)
 module load orca/5.0.4 2>/dev/null || module load orca/4.2.1 2>/dev/null || true
 
 if command -v orca &> /dev/null; then
@@ -384,16 +365,11 @@ fi
 
     return n_ext, output_dir
 
-# ------------------------------------------------------------
-# Main Workflow Execution Pipeline
-# ------------------------------------------------------------
 def main():
     total_start = time.perf_counter()
 
-    # Collect User Configuration
     cfg = get_user_inputs()
 
-    # Prepare Isolated Working Directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     work_dir = Path(f"{cfg['name']}_workflow_{timestamp}")
     work_dir.mkdir(exist_ok=True)
@@ -403,7 +379,7 @@ def main():
 
     timings = {}
 
-    # STEP 1: SMILES -> Initial 3D Geometry (Native RDKit)
+    # STEP 1: SMILES -> Initial 3D Geometry
     print(f"{BOLD}{GREEN}[1/6] Native SMILES ⟶ 3D Embedding (RDKit ETKDGv3){NC}")
     step1_start = time.perf_counter()
     initial_xyz = Path(f"{cfg['name']}_initial.xyz")
@@ -453,7 +429,7 @@ def main():
         print(f" {ICON_FAIL} {RED}Error: crest_conformers.xyz was not generated.{NC}")
         sys.exit(1)
 
-    # STEP 4: Format Conversion (XYZ -> SDF via OpenBabel)
+    # STEP 4: Format Conversion
     print(f"{BOLD}{GREEN}[4/6] Format Conversion (OpenBabel XYZ ⟶ SDF){NC}")
     sdf_out = Path(f"{cfg['name']}_conformers.sdf")
     cmd_obabel = ["obabel", "crest_conformers.xyz", "-O", str(sdf_out)]
@@ -461,7 +437,7 @@ def main():
     timings["OpenBabel Conversion"] = elapsed
     print(f" {ICON_OK} Conformers converted to {sdf_out}\n")
 
-    # STEP 5: Machine-Learned Prioritization & Clustering (CONFPASS)
+    # STEP 5: Prioritization & Clustering
     print(f"{BOLD}{GREEN}[5/6] Prioritization & Clustering (CONFPASS){NC}")
     confpass_log = Path(f"{cfg['name']}_confpass_output.txt")
     cmd_confpass = [sys.executable, "-m", "confpass", str(sdf_out)]
@@ -469,18 +445,17 @@ def main():
     timings["CONFPASS Evaluation"] = elapsed
     print(f" {ICON_OK} CONFPASS output logged to {confpass_log}\n")
 
-    # STEP 6: Top Conformer Extraction & ORCA / SLURM Generation
+    # STEP 6: Top Conformer Extraction
     print(f"{BOLD}{GREEN}[6/6] Generating ORCA Inputs & SLURM Scripts{NC}")
     step6_start = time.perf_counter()
     n_ext, output_dir = extract_and_generate(sdf_out, confpass_log, cfg)
     elapsed = time.perf_counter() - step6_start
     timings["Extraction & QM Inputs"] = elapsed
 
-    # Final Report Generation
     total_elapsed = time.perf_counter() - total_start
     
     summary_text = f"""======================================================================
-CONFADS2C v2.1 — WORKFLOW SUMMARY REPORT
+CONFADS2C v2.2 — WORKFLOW SUMMARY REPORT
 ======================================================================
 
 Molecule Identifier : {cfg['name']}
@@ -516,12 +491,10 @@ TIMING BREAKDOWN:
     summary_text += f"  for f in *.sh; do sbatch \"$f\"; done\n"
     summary_text += f"======================================================================\n"
 
-    # Write summary report file
     summary_file = Path(f"{cfg['name']}_summary.txt")
     with open(summary_file, 'w') as f:
         f.write(summary_text)
 
-    # Terminal Output
     print(f"\n{BOLD}{GREEN}======================================================================{NC}")
     print(f"{BOLD}{GREEN} ✓ WORKFLOW COMPLETED SUCCESSFULLY!{NC}")
     print(f"{BOLD}{GREEN}======================================================================{NC}\n")
