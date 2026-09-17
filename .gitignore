@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.out
+*.log
+*.tmp
+*.sdf
+*_workflow_*/
